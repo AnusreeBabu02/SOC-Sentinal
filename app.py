@@ -21,6 +21,8 @@ from core.ml_engine import run_anomaly_detection
 from core.enricher import enrich_dataframe
 from core.demo_data import generate_demo_logs
 from core.mitre_rules import TACTIC_ORDER
+from core.cve_mapper import enrich_cves
+from core.correlator import correlate_events
 
 # ---------------------------------------------------------------------------
 # Page config + theme
@@ -59,10 +61,12 @@ if "enriched_df" not in st.session_state:
     st.session_state.enriched_df = None
 if "page_num" not in st.session_state:
     st.session_state.page_num = 0
+if "chains" not in st.session_state:
+    st.session_state.chains = []
 
 
 def compute_severity(row):
-    has_mitre = len(row["mitre_hits"]) > 0
+    has_mitre = len(row["mitre_hits"]) > 0 or any(h["evidence"] != "mentioned" for h in row["cve_hits"])
     has_anomaly = bool(row["ml_anomaly"])
     if has_mitre and has_anomaly:
         return "critical"
@@ -73,16 +77,18 @@ def compute_severity(row):
     return "informational"
 
 
-def run_pipeline(raw_text, contamination, strict_sensitivity):
+def run_pipeline(raw_text, contamination, strict_sensitivity, window_min, min_stages):
     records = parse_log_text(raw_text)
     if not records:
-        return None
+        return None, []
     df = pd.DataFrame(records)
     df = run_anomaly_detection(df, contamination=contamination)
     df = enrich_dataframe(df, strict_sensitivity=strict_sensitivity)
+    df = enrich_cves(df)
     df["severity"] = df.apply(compute_severity, axis=1)
     df = df.sort_values("timestamp").reset_index(drop=True)
-    return df
+    df, chains = correlate_events(df, window_min=window_min, min_stages=min_stages)
+    return df, chains
 
 
 # ---------------------------------------------------------------------------
@@ -127,11 +133,21 @@ with st.sidebar:
         help="OFF = broader / case-insensitive matching (more hits). ON = stricter case-sensitive matching (fewer false positives).",
     )
 
+    st.markdown("### ⛓️ Attack Chain Correlation")
+    window_min = st.slider(
+        "Correlation window (minutes)", min_value=5, max_value=180, value=30, step=5,
+        help="Detections on the same host/IP are linked into one incident if they occur within this gap of each other.",
+    )
+    min_stages = st.slider(
+        "Min. distinct ATT&CK tactics per chain", min_value=1, max_value=5, value=2,
+        help="Only report incidents that span at least this many tactics (multi-stage activity).",
+    )
+
     st.markdown("---")
     run_clicked = st.button("▶️ Run Analysis Pipeline", type="primary", use_container_width=True)
 
     st.markdown("---")
-    st.caption("Pipeline: Parser → TF-IDF + Isolation Forest → MITRE/IOC Enricher")
+    st.caption("Pipeline: Parser → TF-IDF + Isolation Forest → MITRE/IOC Enricher → CVE Mapper → Chain Correlator")
 
 # ---------------------------------------------------------------------------
 # Ingest data
@@ -149,12 +165,13 @@ if uploaded_files:
 
 if run_clicked and st.session_state.raw_df:
     with st.spinner("Parsing logs, computing TF-IDF embeddings, running Isolation Forest, matching MITRE rules..."):
-        st.session_state.enriched_df = run_pipeline(
-            st.session_state.raw_df, contamination, strict_sensitivity
+        st.session_state.enriched_df, st.session_state.chains = run_pipeline(
+            st.session_state.raw_df, contamination, strict_sensitivity, window_min, min_stages
         )
         st.session_state.page_num = 0
 
 df = st.session_state.enriched_df
+chains = st.session_state.chains or []
 
 # ---------------------------------------------------------------------------
 # Empty state
@@ -173,13 +190,16 @@ total_logs = len(df)
 total_anomalies = int(df["ml_anomaly"].sum())
 total_mitre_hits = int(df["mitre_hits"].apply(len).sum())
 compromised_hosts = df[df["severity"].isin(["critical", "medium"])]["host"].nunique()
+cve_events = int(df["cve_hits"].apply(len).gt(0).sum())
+unique_cves = len({h["cve_id"] for hits in df["cve_hits"] for h in hits})
 
-k1, k2, k3, k4 = st.columns(4)
+k1, k2, k3, k4, k5 = st.columns(5)
 kpi_defs = [
     (k1, "Total Logs Analyzed", f"{total_logs:,}", "", "info"),
     (k2, "Statistical Anomalies", f"{total_anomalies:,}", "Isolation Forest flagged", "medium"),
     (k3, "MITRE ATT&CK Hits", f"{total_mitre_hits:,}", f"{df['mitre_hits'].apply(len).gt(0).sum()} events matched", "critical"),
     (k4, "Compromised Hosts/Assets", f"{compromised_hosts:,}", "unique hosts w/ high+ severity", "critical"),
+    (k5, "CVEs Mapped", f"{unique_cves:,}", f"{cve_events} events", "critical"),
 ]
 for col, label, value, sub, cls in kpi_defs:
     with col:
@@ -263,12 +283,97 @@ st.plotly_chart(fig_ts, use_container_width=True)
 
 st.markdown("<br>", unsafe_allow_html=True)
 
+st.markdown('<div class="section-header">🐞 CVE Vulnerability Mapping</div>', unsafe_allow_html=True)
+
+cve_agg = {}
+for _, r in df.iterrows():
+    for h in r["cve_hits"]:
+        d = cve_agg.setdefault((h["cve_id"], h["evidence"]), {
+            "CVE": h["cve_id"], "Name": h["name"], "CVSS": h["cvss"], "Severity": h["severity"],
+            "Finding": h["evidence"].replace("_", " "), "Events": 0, "Hosts": set(), "NVD": h["url"],
+        })
+        d["Events"] += 1
+        d["Hosts"].add(r["host"])
+
+if cve_agg:
+    cve_df = pd.DataFrame(cve_agg.values())
+    cve_df["Hosts"] = cve_df["Hosts"].apply(lambda s: ", ".join(sorted(s)))
+    cve_df = cve_df.sort_values(["CVSS", "Events"], ascending=False, na_position="last")
+    st.dataframe(
+        cve_df, use_container_width=True, hide_index=True,
+        column_config={
+            "CVSS": st.column_config.NumberColumn(format="%.1f"),
+            "NVD": st.column_config.LinkColumn("NVD", display_text="Open ↗"),
+        },
+    )
+    st.caption("“exploit attempt” = payload seen in traffic. “vulnerable version” = banner in a known-vulnerable range "
+               "(verify: distro backports may already be patched). “mentioned” = literal CVE ID in the log.")
+else:
+    st.info("No CVE indicators found in this dataset.")
+
+st.markdown("<br>", unsafe_allow_html=True)
+
+# ---------------------------------------------------------------------------
+# Temporal Attack-Chain Correlation
+# ---------------------------------------------------------------------------
+st.markdown('<div class="section-header">⛓️ Attack Chain Correlation</div>', unsafe_allow_html=True)
+
+if chains:
+    st.caption(f"{len(chains)} multi-stage incident(s) found — detections linked by shared host/IP within "
+               f"{window_min} min, scored on tactic diversity, kill-chain order, known playbooks and CVE severity.")
+    chain_df = pd.DataFrame([{
+        "Incident": c["chain_id"], "Level": c["level"].upper(), "Score": c["score"],
+        "Start": c["start"].strftime("%Y-%m-%d %H:%M:%S"), "Duration (min)": c["duration_min"],
+        "Hosts": ", ".join(c["hosts"]), "Events": c["n_events"],
+        "Kill-chain path": c["path"], "Playbook match": "; ".join(c["playbooks"]) or "—",
+        "CVEs": ", ".join(c["cves"]) or "—",
+    } for c in chains])
+    st.dataframe(
+        chain_df, use_container_width=True, hide_index=True,
+        column_config={"Score": st.column_config.ProgressColumn("Score", min_value=0, max_value=100, format="%d")},
+    )
+
+    chain_labels = {f"{c['chain_id']} · {c['level'].upper()} · {c['score']} · {c['path']}": c for c in chains}
+    sel_chain = chain_labels[st.selectbox("Inspect incident timeline", list(chain_labels.keys()))]
+    ch_events = df[df["chain_id"] == sel_chain["chain_id"]].sort_values("timestamp")
+    stage_order = [t for t in TACTIC_ORDER if t in set(ch_events["chain_stage"])]
+
+    fig_ch = px.scatter(
+        ch_events.assign(severity_label=ch_events["severity"].map(SEV_LABELS)),
+        x="timestamp", y="chain_stage", color="severity_label",
+        color_discrete_map={SEV_LABELS[k]: v for k, v in SEV_COLORS.items()},
+        category_orders={"chain_stage": stage_order}, hover_data=["host", "process", "message"],
+    )
+    fig_ch.add_trace(go.Scatter(
+        x=ch_events["timestamp"], y=ch_events["chain_stage"], mode="lines",
+        line=dict(color="rgba(137,150,171,0.5)", width=1, dash="dot"), hoverinfo="skip", showlegend=False,
+    ))
+    fig_ch.update_traces(selector=dict(mode="markers"), marker=dict(size=10))
+    fig_ch.update_layout(
+        template=PLOTLY_TEMPLATE, height=320, margin=dict(t=10, b=10, l=10, r=10),
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, font=dict(size=10)),
+        xaxis_title=None, yaxis_title=None,
+    )
+    st.plotly_chart(fig_ch, use_container_width=True)
+    st.caption(f"Hosts: {', '.join(sel_chain['hosts'])} · IPs: {', '.join(sel_chain['ips']) or '—'} · "
+               f"Techniques: {', '.join(sel_chain['techniques']) or '—'} · Kill-chain progression: {sel_chain['progression']:.0%}")
+    with st.expander("Events in this incident"):
+        st.dataframe(
+            ch_events[["timestamp", "host", "chain_stage", "severity", "message"]],
+            use_container_width=True, hide_index=True,
+        )
+else:
+    st.info("No multi-stage attack chains found. Try a wider correlation window or a lower minimum tactic count.")
+
+st.markdown("<br>", unsafe_allow_html=True)
+
 # ---------------------------------------------------------------------------
 # Wazuh-style Event Explorer
 # ---------------------------------------------------------------------------
 st.markdown('<div class="section-header">🔎 Event Explorer</div>', unsafe_allow_html=True)
 
-f1, f2, f3, f4 = st.columns([2, 1, 1, 1])
+f1, f2, f3, f4, f5 = st.columns([2, 1, 1, 1, 1])
 with f1:
     search_text = st.text_input("Search raw messages", placeholder="e.g. powershell, failed password, union select...")
 with f2:
@@ -278,6 +383,9 @@ with f3:
     host_filter = st.selectbox("Host", ["All"] + sorted(df["host"].unique().tolist()))
 with f4:
     severity_filter = st.selectbox("Severity", ["All", "critical", "medium", "suspicious", "informational"])
+with f5:
+    all_cves = sorted({c for ids in df["cve_ids"] for c in ids})
+    cve_filter = st.selectbox("CVE", ["All"] + all_cves)
 
 filtered = df.copy()
 if search_text:
@@ -289,6 +397,8 @@ if host_filter != "All":
     filtered = filtered[filtered["host"] == host_filter]
 if severity_filter != "All":
     filtered = filtered[filtered["severity"] == severity_filter]
+if cve_filter != "All":
+    filtered = filtered[filtered["cve_ids"].apply(lambda ids: cve_filter in ids)]
 
 st.caption(f"Showing {len(filtered):,} of {len(df):,} events")
 
@@ -316,6 +426,7 @@ def badge_html(sev):
 rows_html = ""
 for _, r in page_df.iterrows():
     techs = ", ".join(r["technique_ids"]) if r["technique_ids"] else "—"
+    cves = ", ".join(r["cve_ids"]) if r["cve_ids"] else "—"
     ts_str = r["timestamp"].strftime("%Y-%m-%d %H:%M:%S") if pd.notnull(r["timestamp"]) else "—"
     msg = (r["message"][:90] + "…") if len(str(r["message"])) > 90 else r["message"]
     rows_html += f"""<tr>
@@ -324,6 +435,7 @@ for _, r in page_df.iterrows():
         <td>{r['process']}</td>
         <td>{badge_html(r['severity'])}</td>
         <td class="mono">{techs}</td>
+        <td class="mono">{cves}</td>
         <td class="msg-cell" title="{str(r['message']).replace('"','&quot;')}">{msg}</td>
     </tr>"""
 
@@ -331,9 +443,9 @@ table_html = f"""
 <div class="event-table-wrap">
 <table class="event-table">
     <thead><tr>
-        <th>Timestamp</th><th>Host</th><th>Process</th><th>Severity</th><th>Technique(s)</th><th>Message</th>
+        <th>Timestamp</th><th>Host</th><th>Process</th><th>Severity</th><th>Technique(s)</th><th>CVE(s)</th><th>Message</th>
     </tr></thead>
-    <tbody>{rows_html if rows_html else '<tr><td colspan="6" style="color:#8996ab;padding:14px;">No events match the current filters.</td></tr>'}</tbody>
+    <tbody>{rows_html if rows_html else '<tr><td colspan="7" style="color:#8996ab;padding:14px;">No events match the current filters.</td></tr>'}</tbody>
 </table>
 </div>
 """
@@ -365,6 +477,8 @@ if len(page_df) > 0:
             "ml_anomaly": bool(selected_row["ml_anomaly"]),
             "anomaly_score": float(selected_row["anomaly_score"]),
             "mitre_hits": selected_row["mitre_hits"],
+            "cve_hits": selected_row["cve_hits"],
+            "chain_id": selected_row["chain_id"],
             "iocs": selected_row["iocs"],
             "message": selected_row["message"],
             "raw": selected_row["raw"],
@@ -384,6 +498,8 @@ export_df = df.copy()
 export_df["timestamp"] = export_df["timestamp"].astype(str)
 export_df["mitre_hits"] = export_df["mitre_hits"].apply(json.dumps)
 export_df["iocs"] = export_df["iocs"].apply(json.dumps)
+export_df["cve_hits"] = export_df["cve_hits"].apply(json.dumps)
+export_df["cve_ids"] = export_df["cve_ids"].apply(lambda x: ", ".join(x))
 export_df["technique_ids"] = export_df["technique_ids"].apply(lambda x: ", ".join(x))
 export_df["tactics"] = export_df["tactics"].apply(lambda x: ", ".join(x))
 
@@ -416,6 +532,24 @@ if show_summary:
     lines.append("Top techniques:")
     for k, v in sorted(technique_counts.items(), key=lambda x: -x[1])[:10]:
         lines.append(f"  - {k[0]} ({k[1]}) — {v} hits [{k[2]}]")
+    lines += ["", "Correlated attack chains:"]
+    if chains:
+        for c in chains:
+            lines.append(f"  - {c['chain_id']} [{c['level'].upper()}, score {c['score']}] {c['path']} "
+                         f"on {', '.join(c['hosts'])} ({c['n_events']} events, {c['duration_min']} min)")
+            if c["playbooks"]:
+                lines.append(f"      playbook: {'; '.join(c['playbooks'])}")
+    else:
+        lines.append("  - none detected")
+    lines += ["", "CVE findings:"]
+    if cve_agg:
+        for (cid, ev), d in sorted(cve_agg.items(), key=lambda x: -(x[1]["CVSS"] or 0)):
+            lines.append(
+                f"  - {cid} ({d['Name']}) CVSS {d['CVSS']} [{d['Finding']}] — "
+                f"{d['Events']} events on {', '.join(sorted(d['Hosts']))}"
+            )
+    else:
+        lines.append("  - none detected")
     summary_text = "\n".join(lines)
     st.code(summary_text, language="text")
     st.caption("Use the copy icon in the top-right of the code block above to copy this summary for incident reporting.")
